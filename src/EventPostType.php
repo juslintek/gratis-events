@@ -1,61 +1,157 @@
 <?php declare(strict_types=1);
+
 namespace Gratis\Events;
 
-final class EventPostType
-{
-    public static function register(): void
-    {
-        register_post_type('gratis_event', [
-            'labels' => ['name' => 'Events', 'singular_name' => 'Event'],
-            'public' => true, 'show_in_rest' => true, 'menu_icon' => 'dashicons-calendar',
-            'supports' => ['title', 'editor', 'thumbnail', 'excerpt', 'custom-fields'],
-            'has_archive' => true, 'rewrite' => ['slug' => 'events'],
-        ]);
-        register_taxonomy('event_category', 'gratis_event', [
-            'labels' => ['name' => 'Event Categories'], 'hierarchical' => true,
-            'public' => true, 'show_in_rest' => true,
-        ]);
-        register_post_meta('gratis_event', '_start_date', ['type' => 'string', 'single' => true, 'show_in_rest' => true]);
-        register_post_meta('gratis_event', '_end_date', ['type' => 'string', 'single' => true, 'show_in_rest' => true]);
-        register_post_meta('gratis_event', '_venue', ['type' => 'string', 'single' => true, 'show_in_rest' => true]);
-        register_post_meta('gratis_event', '_capacity', ['type' => 'integer', 'single' => true, 'show_in_rest' => true]);
-        register_post_meta('gratis_event', '_rsvp_count', ['type' => 'integer', 'single' => true, 'show_in_rest' => true]);
-        register_post_meta('gratis_event', '_recurring', ['type' => 'string', 'single' => true, 'show_in_rest' => true]);
+defined('ABSPATH') || exit;
 
-        // RSVP endpoint
-        add_action('rest_api_init', function () {
-            register_rest_route('gratis-events/v1', '/rsvp/(?P<event_id>\d+)', [
-                'methods' => 'POST', 'permission_callback' => '__return_true',
-                'callback' => function ($req) {
-                    $event_id = (int) $req['event_id'];
-                    $data = $req->get_json_params();
-                    $count = (int) get_post_meta($event_id, '_rsvp_count', true);
-                    $capacity = (int) get_post_meta($event_id, '_capacity', true);
-                    if ($capacity && $count >= $capacity) return new \WP_REST_Response(['error' => 'Event full'], 400);
-                    update_post_meta($event_id, '_rsvp_count', $count + 1);
-                    do_action('gratis_event_rsvp', $event_id, $data);
-                    return new \WP_REST_Response(['success' => true, 'attendees' => $count + 1]);
-                },
+/**
+ * Registers the event post type, taxonomy, meta, the RSVP REST endpoint and the
+ * `[gratis_events]` listing shortcode.
+ */
+final class EventPostType {
+
+    public const POST_TYPE = 'gratis_event';
+    public const TAXONOMY  = 'event_category';
+
+    /** Register the post type, taxonomy, meta and shortcodes. */
+    public static function register(): void {
+        register_post_type(self::POST_TYPE, [
+            'labels'      => [
+                'name'          => __('Events', 'gratis-events'),
+                'singular_name' => __('Event', 'gratis-events'),
+            ],
+            'public'       => true,
+            'show_in_rest' => true,
+            'menu_icon'    => 'dashicons-calendar',
+            'supports'     => ['title', 'editor', 'thumbnail', 'excerpt', 'custom-fields'],
+            'has_archive'  => true,
+            'rewrite'      => ['slug' => 'events'],
+        ]);
+
+        register_taxonomy(self::TAXONOMY, self::POST_TYPE, [
+            'labels'       => ['name' => __('Event Categories', 'gratis-events')],
+            'hierarchical' => true,
+            'public'       => true,
+            'show_in_rest' => true,
+        ]);
+
+        $meta = [
+            '_start_date' => 'string',
+            '_end_date'   => 'string',
+            '_venue'      => 'string',
+            '_recurring'  => 'string',
+            '_capacity'   => 'integer',
+            '_rsvp_count' => 'integer',
+        ];
+        foreach ($meta as $key => $type) {
+            register_post_meta(self::POST_TYPE, $key, [
+                'type'          => $type,
+                'single'        => true,
+                'show_in_rest'  => true,
+                'auth_callback' => static fn() => current_user_can('edit_posts'),
             ]);
-        });
+        }
 
-        // iCal export
-        add_action('template_redirect', function () {
-            if (!isset($_GET['gratis_ical'])) return;
-            $event_id = (int) $_GET['gratis_ical'];
-            $event = get_post($event_id);
-            if (!$event) return;
-            header('Content-Type: text/calendar; charset=utf-8');
-            header('Content-Disposition: attachment; filename="event.ics"');
-            $start = get_post_meta($event_id, '_start_date', true);
-            $end = get_post_meta($event_id, '_end_date', true) ?: $start;
-            echo "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n";
-            echo "DTSTART:" . gmdate('Ymd\THis\Z', strtotime($start)) . "\r\n";
-            echo "DTEND:" . gmdate('Ymd\THis\Z', strtotime($end)) . "\r\n";
-            echo "SUMMARY:" . $event->post_title . "\r\n";
-            echo "LOCATION:" . get_post_meta($event_id, '_venue', true) . "\r\n";
-            echo "END:VEVENT\r\nEND:VCALENDAR\r\n";
-            exit;
-        });
+        add_shortcode('gratis_events', [__CLASS__, 'shortcode']);
+        add_shortcode('gratis-events', [__CLASS__, 'shortcode']);
+    }
+
+    /** Register the RSVP REST route. */
+    public static function registerAPI(): void {
+        register_rest_route('gratis-events/v1', '/rsvp/(?P<event_id>\d+)', [
+            'methods'             => 'POST',
+            'permission_callback' => '__return_true',
+            'callback'            => [__CLASS__, 'restRsvp'],
+        ]);
+    }
+
+    /** Handle an RSVP, enforcing capacity. */
+    public static function restRsvp(\WP_REST_Request $req): \WP_REST_Response {
+        $event_id = (int) $req['event_id'];
+        if (self::POST_TYPE !== get_post_type($event_id)) {
+            return new \WP_REST_Response(['error' => __('Unknown event.', 'gratis-events')], 404);
+        }
+
+        $data     = (array) $req->get_json_params();
+        $count    = (int) get_post_meta($event_id, '_rsvp_count', true);
+        $capacity = (int) get_post_meta($event_id, '_capacity', true);
+
+        if ($capacity && $count >= $capacity) {
+            return new \WP_REST_Response(['error' => __('Event is full.', 'gratis-events')], 400);
+        }
+
+        update_post_meta($event_id, '_rsvp_count', $count + 1);
+        do_action('gratis_event_rsvp', $event_id, $data);
+
+        return new \WP_REST_Response(['success' => true, 'attendees' => $count + 1]);
+    }
+
+    /**
+     * Render an upcoming-events list.
+     *
+     * @param array<string,mixed>|string $atts Shortcode attributes.
+     */
+    public static function shortcode($atts): string {
+        $atts = shortcode_atts([
+            'limit'    => 10,
+            'category' => '',
+            'past'     => 'no',
+        ], $atts, 'gratis_events');
+
+        $args = [
+            'post_type'      => self::POST_TYPE,
+            'posts_per_page' => max(1, min(100, absint($atts['limit']))),
+            // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- ordering events by their date.
+            'meta_key'       => '_start_date',
+            'orderby'        => 'meta_value',
+            'order'          => 'yes' === $atts['past'] ? 'DESC' : 'ASC',
+            // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- date-window filter is the intended behaviour.
+            'meta_query'     => [[
+                'key'     => '_start_date',
+                'value'   => gmdate('Y-m-d'),
+                'compare' => 'yes' === $atts['past'] ? '<' : '>=',
+            ],],
+        ];
+
+        if ('' !== $atts['category']) {
+            $args['tax_query'] = [[
+                'taxonomy' => self::TAXONOMY,
+                'field'    => 'slug',
+                'terms'    => sanitize_title((string) $atts['category']),
+            ],];
+        }
+
+        $events = get_posts($args);
+        if (empty($events)) {
+            return '<p class="gratis-events-empty">' . esc_html__('No upcoming events.', 'gratis-events') . '</p>';
+        }
+
+        $out = '<ul class="gratis-events-list">';
+        foreach ($events as $event) {
+            $start = (string) get_post_meta($event->ID, '_start_date', true);
+            $venue = (string) get_post_meta($event->ID, '_venue', true);
+
+            $out .= '<li class="gratis-event">';
+            $out .= '<a class="gratis-event__title" href="' . esc_url((string) get_permalink($event->ID)) . '">' . esc_html($event->post_title) . '</a>';
+            if ('' !== $start) {
+                $out .= ' <span class="gratis-event__date">' . esc_html(self::formatDate($start)) . '</span>';
+            }
+            if ('' !== $venue) {
+                $out .= ' <span class="gratis-event__venue">' . esc_html($venue) . '</span>';
+            }
+            $out .= '</li>';
+        }
+        $out .= '</ul>';
+
+        return $out;
+    }
+
+    /** Format a stored date string using the site's date format. */
+    public static function formatDate(string $value): string {
+        $ts = strtotime($value);
+        if (false === $ts) {
+            return $value;
+        }
+        return wp_date(get_option('date_format', 'Y-m-d'), $ts) ?: $value;
     }
 }
