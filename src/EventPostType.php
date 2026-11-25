@@ -65,14 +65,27 @@ final class EventPostType {
         ]);
     }
 
-    /** Handle an RSVP, enforcing capacity. */
+    /** Handle an RSVP, enforcing published status, rate limiting, and capacity. */
     public static function restRsvp(\WP_REST_Request $req): \WP_REST_Response {
         $event_id = (int) $req['event_id'];
-        if (self::POST_TYPE !== get_post_type($event_id)) {
+        if (self::POST_TYPE !== get_post_type($event_id) || 'publish' !== get_post_status($event_id)) {
             return new \WP_REST_Response(['error' => __('Unknown event.', 'gratis-events')], 404);
         }
 
-        $data     = (array) $req->get_json_params();
+        $ip = isset($_SERVER['REMOTE_ADDR'])
+            ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR']))
+            : '';
+        $ip       = (string) filter_var($ip, FILTER_VALIDATE_IP);
+        $rate_key = 'gratis_ev_rsvp_' . $event_id . '_' . substr(hash('sha256', wp_salt('nonce') . '|' . gmdate('Y-m-d') . '|' . $ip), 0, 12);
+        if (get_transient($rate_key)) {
+            return new \WP_REST_Response(['error' => __('You have already RSVPed for this event recently.', 'gratis-events')], 429);
+        }
+
+        $raw      = (array) $req->get_json_params();
+        $data     = [
+            'name'  => sanitize_text_field((string) ($raw['name'] ?? '')),
+            'email' => sanitize_email((string) ($raw['email'] ?? '')),
+        ];
         $count    = (int) get_post_meta($event_id, '_rsvp_count', true);
         $capacity = (int) get_post_meta($event_id, '_capacity', true);
 
@@ -80,6 +93,7 @@ final class EventPostType {
             return new \WP_REST_Response(['error' => __('Event is full.', 'gratis-events')], 400);
         }
 
+        set_transient($rate_key, 1, HOUR_IN_SECONDS);
         update_post_meta($event_id, '_rsvp_count', $count + 1);
         do_action('gratis_event_rsvp', $event_id, $data);
 
