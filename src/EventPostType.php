@@ -114,6 +114,7 @@ final class EventPostType {
         ];
 
         if ('' !== $atts['category']) {
+            // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_tax_query -- category-filtered event listing.
             $args['tax_query'] = [[
                 'taxonomy' => self::TAXONOMY,
                 'field'    => 'slug',
